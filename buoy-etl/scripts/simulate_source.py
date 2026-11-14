@@ -14,6 +14,10 @@ def main() -> int:
     parser.add_argument("--key", required=True)
     parser.add_argument("--delay", type=float, default=0.0, help="每个 256KiB 块后的休眠秒数")
     parser.add_argument("--fail-after", type=int, default=0, help="发送多少字节后中途断开；0 表示不断")
+    parser.add_argument(
+        "--hold", type=float, default=0.0,
+        help="响应头发出后、首个数据块前挂住的秒数（模拟连接正常但暂无数据的慢岸站）",
+    )
     parser.add_argument("--clear", action="store_true", help="清除该 key 的注入")
     args = parser.parse_args()
 
@@ -25,7 +29,12 @@ def main() -> int:
         return 0
 
     body = json.dumps(
-        {"key": args.key, "delay_per_chunk": args.delay, "fail_after_bytes": args.fail_after}
+        {
+            "key": args.key,
+            "delay_per_chunk": args.delay,
+            "fail_after_bytes": args.fail_after,
+            "hold_seconds": args.hold,
+        }
     ).encode()
     req = urllib.request.Request(
         f"{base}/admin/simulate",

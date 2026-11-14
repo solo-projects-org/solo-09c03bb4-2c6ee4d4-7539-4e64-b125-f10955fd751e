@@ -11,6 +11,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -216,3 +217,112 @@ def test_503_when_cache_full_and_all_busy(object_source, cache_paths):
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+
+def _start_web(label, port, object_url, cache_paths, ttl, demo=False):
+    env = dict(os.environ)
+    env.update(
+        SQLITE_PATH=cache_paths["sqlite"],
+        CACHE_DIR=cache_paths["files"],
+        OBJECT_SOURCE_URL=object_url,
+        CACHE_LIMIT_BYTES=str(10 * 1024 * 1024),
+        STALE_DOWNLOAD_TTL=str(ttl),
+        PROCESS_LABEL=label,
+        PYTHONPATH=str(ROOT),
+    )
+    if demo:
+        env["DEMO_MODE"] = "1"
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "web.app:app",
+         "--host", "127.0.0.1", "--port", str(port), "--log-level", "warning"],
+        cwd=str(ROOT), env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    return proc
+
+
+def test_downloader_killed_peer_reaps_and_retry_succeeds(object_source, cache_paths):
+    """web1 下载中被杀死（无清理机会），web2 reaper 回收后重试只下载一次。"""
+    base_url, store = object_source
+    port1, port2 = _free_port(), _free_port()
+    # 短 TTL，让存活进程能快速判定僵死。
+    p1 = _start_web("web-kill", port1, base_url, cache_paths, ttl=1.0, demo=True)
+    p2 = _start_web("web-live", port2, base_url, cache_paths, ttl=1.0)
+    url1, url2 = f"http://127.0.0.1:{port1}", f"http://127.0.0.1:{port2}"
+    try:
+        _wait_healthy(p1, url1)
+        _wait_healthy(p2, url2)
+
+        with httpx.Client(timeout=30.0) as client:
+            # 让 web1 的下一次下载冻结在首块前（心跳仍在跑）。
+            assert client.post(f"{url1}/api/demo/freeze").status_code == 200
+
+            # 查询在后台线程发起：冻结期间响应头尚未返回，主线程通过缓存
+            # 面板观察 downloading 行，而不是阻塞在响应上。
+            def _frozen_query():
+                try:
+                    return client.get(f"{url1}/api/query", params={
+                        "key": "day1.parquet",
+                        "start": DAY_START, "end": DAY_START + 60})
+                except httpx.HTTPError:
+                    return None  # 进程随后会被杀死，连接错误是预期的
+
+            qthread = threading.Thread(target=_frozen_query, daemon=True)
+            qthread.start()
+
+            deadline = time.time() + 10
+            downloading = False
+            while time.time() < deadline:
+                snap = client.get(f"{url1}/api/cache").json()
+                if any(e["key"] == "day1.parquet" and e["state"] == "downloading"
+                       for e in snap["entries"]):
+                    downloading = True
+                    break
+                time.sleep(0.2)
+            assert downloading, "冻结的下载行未在时限内出现"
+
+            # 直接杀死下载进程，模拟“被回收/崩溃”，它没有机会清理。
+            p1.kill()
+            p1.wait(timeout=10)
+            qthread.join(timeout=5)
+
+            # web2 存活：其 reaper 在 ~TTL+reap 间隔内回收僵死行与残件。
+            deadline = time.time() + 25
+            recovered = False
+            while time.time() < deadline:
+                snap = client.get(f"{url2}/api/cache").json()
+                dl = [e for e in snap["entries"] if e["key"] == "day1.parquet"]
+                if not dl:
+                    recovered = True
+                    break
+                time.sleep(0.5)
+            assert recovered, "存活进程未在时限内回收僵死下载"
+            assert snap["residue_bytes"] == 0
+
+            # 重试：同档同版由 web2 重新预留接管并成功，仅一次有效下载。
+            store._gets = 0
+            original = store.stream
+
+            def counting(key, write, flush):
+                store._gets = getattr(store, "_gets", 0) + 1
+                return original(key, write, flush)
+
+            store.stream = counting
+            r = client.get(f"{url2}/api/query", params={
+                "key": "day1.parquet", "start": DAY_START, "end": DAY_START + 60})
+            assert r.status_code == 200
+            assert len(r.text.strip().splitlines()) == 2
+            assert store._gets == 1  # 重试只触发一次源端 GET
+            snap = client.get(f"{url2}/api/cache").json()
+            assert len(snap["entries"]) == 1
+            assert snap["entries"][0]["state"] == "complete"
+            assert snap["residue_bytes"] == 0
+    finally:
+        if p1.poll() is None:
+            p1.kill()
+        p2.terminate()
+        for proc in (p1, p2):
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()

@@ -29,6 +29,11 @@ logger = logging.getLogger("buoy.web")
 CACHE_LIMIT_DEFAULT = 64 * 1024 * 1024  # 64 MiB：下载预留 + 完整缓存合计
 LEASE_HEARTBEAT_SECONDS = 10.0
 REAP_INTERVAL_SECONDS = 10.0
+# 下载心跳独立于数据到达；下载行超过该 TTL 未续期才判定僵死。
+STALE_DOWNLOAD_TTL_DEFAULT = 30.0
+LEASE_TTL_DEFAULT = 30.0
+# 传输层读超时给慢源充分余量；失效判定以心跳为准，避免误杀活连接。
+READ_TIMEOUT_DEFAULT = 300.0
 # 断开检测的 receive 轮询周期：既不长期占用 receive，又能及时发现浏览器断开。
 DISCONNECT_POLL_SECONDS = 5.0
 
@@ -55,9 +60,20 @@ def create_app(
         else int(_env("CACHE_LIMIT_BYTES", str(CACHE_LIMIT_DEFAULT)))
     )
     process_label = process_label or _env("PROCESS_LABEL", f"pid-{os.getpid()}")
+    stale_ttl = float(_env("STALE_DOWNLOAD_TTL", str(STALE_DOWNLOAD_TTL_DEFAULT)))
+    lease_ttl = float(_env("LEASE_TTL", str(LEASE_TTL_DEFAULT)))
+    read_timeout = float(_env("SOURCE_READ_TIMEOUT", str(READ_TIMEOUT_DEFAULT)))
 
-    coord = Coordinator(sqlite_path, limit_bytes)
-    manager = CacheManager(coord, object_source_url, cache_dir)
+    coord = Coordinator(
+        sqlite_path,
+        limit_bytes,
+        cache_dir=cache_dir,
+        stale_download_ttl=stale_ttl,
+        lease_ttl=lease_ttl,
+    )
+    manager = CacheManager(
+        coord, object_source_url, cache_dir, read_timeout=read_timeout
+    )
 
     app = FastAPI(title="浮标温盐观测提取", version="1.0.0")
     templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -110,7 +126,26 @@ def create_app(
     async def cache_status() -> JSONResponse:
         snap = await manager.snapshot()
         snap["served_by"] = process_label
+        snap["demo_mode"] = os.environ.get("DEMO_MODE") == "1"
         return JSONResponse(snap)
+
+    # ----------------------------------------------------演示：下载接管竞态
+    # 仅当显式打开 DEMO_MODE 时挂载，用于现场制造“旧下载僵住 → 被 reaper
+    # 接管 → 旧下载迟到结束也不能发布/覆盖”的竞态；默认关闭，不影响生产语义。
+    if os.environ.get("DEMO_MODE") == "1":
+        @app.post("/api/demo/freeze")
+        async def demo_freeze() -> JSONResponse:
+            manager.install_freeze_hook()
+            return JSONResponse(
+                {"ok": True, "frozen": True,
+                 "detail": "下一次下载会在首块数据前挂起，心跳仍在续期；"
+                           "停止心跳或等待 TTL 后由 reaper 接管。"}
+            )
+
+        @app.post("/api/demo/release")
+        async def demo_release() -> JSONResponse:
+            manager.clear_freeze_hook()
+            return JSONResponse({"ok": True, "frozen": False})
 
     # ----------------------------------------------------------查询主接口
     @app.get("/api/query")
@@ -153,7 +188,10 @@ def create_app(
                 {"detail": f"源端更正导致版本固定失败：{exc}"}, status_code=409
             )
         except (VersionGone, DownloadAttemptsExhausted) as exc:
-            return JSONResponse({"detail": f"取档失败：{exc}"}, status_code=409)
+            return JSONResponse(
+                {"detail": f"取档失败（下载尝试已放弃/被接管，可重试）：{exc}"},
+                status_code=409,
+            )
         except httpx.HTTPError as exc:
             # 连接中断、源端中途断开等传输层失败；残件与预留已在 ensure 内清理。
             return JSONResponse(

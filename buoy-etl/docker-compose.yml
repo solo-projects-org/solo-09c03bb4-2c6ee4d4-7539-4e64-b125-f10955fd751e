@@ -40,6 +40,13 @@ services:
       CACHE_DIR: /data/cache/files
       OBJECT_SOURCE_URL: http://object-source:8080
       CACHE_LIMIT_BYTES: ${CACHE_LIMIT_BYTES:-67108864}
+      # 下载失效判定：独立心跳按 2s 节拍续期，超过该 TTL 未续期才回收。
+      STALE_DOWNLOAD_TTL: ${STALE_DOWNLOAD_TTL:-30}
+      LEASE_TTL: "30"
+      # 传输层读超时给慢源充分余量，正常连接内无数据不会被传输层误杀。
+      SOURCE_READ_TIMEOUT: ${SOURCE_READ_TIMEOUT:-300}
+      # 置 1 开启网页上的“冻结/接管”演示控制端点。
+      DEMO_MODE: ${DEMO_MODE:-1}
       PROCESS_LABEL: web-1
     volumes:
       - cache_data:/data/cache
@@ -60,6 +67,10 @@ services:
       CACHE_DIR: /data/cache/files
       OBJECT_SOURCE_URL: http://object-source:8080
       CACHE_LIMIT_BYTES: ${CACHE_LIMIT_BYTES:-67108864}
+      STALE_DOWNLOAD_TTL: ${STALE_DOWNLOAD_TTL:-30}
+      LEASE_TTL: "30"
+      SOURCE_READ_TIMEOUT: ${SOURCE_READ_TIMEOUT:-300}
+      DEMO_MODE: ${DEMO_MODE:-1}
       PROCESS_LABEL: web-2
     volumes:
       - cache_data:/data/cache

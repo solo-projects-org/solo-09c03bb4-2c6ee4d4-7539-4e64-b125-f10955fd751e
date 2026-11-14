@@ -93,11 +93,21 @@
     <div class="bar" style="margin-top:8px;"><i id="barfill"></i></div>
     <table>
       <thead>
-        <tr><th>日档</th><th>状态</th><th>大小</th><th>租用数</th><th>持有者</th><th>ETag</th></tr>
+        <tr><th>日档</th><th>状态</th><th>记账大小</th><th>租用数</th><th>持有者 / 尝试</th><th>ETag</th></tr>
       </thead>
       <tbody id="cachebody"><tr><td colspan="6" class="hint">加载中…</td></tr></tbody>
     </table>
-    <p class="hint">「租用数」即正在查询的读者数；只有租用数为 0 的完整文件可被 LRU 淘汰。</p>
+    <p class="hint">「记账大小」对下载中条目是按源端全长的预留（临时残件含在其中，不重复计账）；
+    无主残件在上方用量中单列。只有租用数为 0 的完整文件可被 LRU 淘汰。</p>
+    <div id="demopanel" class="hint" style="margin-top:14px; display:none; border-top:1px solid var(--line); padding-top:12px;">
+      <h2 style="color:var(--warn); font-size:14px; margin:0 0 8px;">③ 演示控制（DEMO_MODE）</h2>
+      <p class="hint" style="margin-top:0;">冻结下一次下载（首块前挂起、心跳仍续期），配合强制接管可演示
+      “旧下载迟到结束也不能发布/覆盖接替者文件”。</p>
+      <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <button id="freeze" class="ghost">冻结下一次下载</button>
+        <button id="release" class="ghost">释放冻结</button>
+      </div>
+    </div>
   </section>
 </main>
 
@@ -137,8 +147,13 @@ async function loadCache() {
     const r = await fetch("/api/cache");
     const s = await r.json();
     const pct = s.limit_bytes ? (s.total_bytes / s.limit_bytes * 100) : 0;
+    const residueLine = s.residue_bytes
+      ? ` · 无主残件 <b style="color:var(--warn)">${fmtBytes(s.residue_bytes)}</b>`
+      : "";
     $("usage").innerHTML =
-      `已用 <b>${fmtBytes(s.total_bytes)}</b> / ${fmtBytes(s.limit_bytes)}（${pct.toFixed(1)}%）· 活跃租用 ${s.lease_count} · 服务实例 <code>${s.served_by}</code>`;
+      `磁盘实占 <b>${fmtBytes(s.total_bytes)}</b> / ${fmtBytes(s.limit_bytes)}（${pct.toFixed(1)}%）`
+      + ` · 账本（预留+完整）${fmtBytes(s.ledger_bytes)}${residueLine}`
+      + ` · 活跃租用 ${s.lease_count} · 服务实例 <code>${s.served_by}</code>`;
     const fill = $("barfill");
     fill.style.width = Math.min(100, pct) + "%";
     fill.className = pct >= 100 ? "full" : (pct >= 80 ? "hot" : "");
@@ -152,11 +167,32 @@ async function loadCache() {
           <td><span class="tag ${e.state}">${e.state === "complete" ? "完整" : "下载中"}</span></td>
           <td>${fmtBytes(e.size)}</td>
           <td>${e.leases}</td>
-          <td>${e.owner ? e.owner.split(":").slice(0, 2).join(":") : "—"}</td>
+          <td title="owner / attempt fencing token">${e.owner ? e.owner.split(":").slice(0, 2).join(":") : "—"}<br><code style="font-size:11px;">${(e.attempt_id || "").slice(0, 8)}</code></td>
           <td><code>${e.etag.slice(0, 14)}…</code></td>
         </tr>`).join("");
     }
   } catch (e) { /* 轮询失败静默 */ }
+}
+
+async function demoAction(path) {
+  try {
+    const r = await fetch(path, { method: "POST" });
+    const j = await r.json();
+    msg(r.ok ? "warn" : "err", (j.detail || JSON.stringify(j)));
+  } catch (e) { msg("err", "演示控制失败：" + e); }
+}
+
+async function initDemoPanel() {
+  // 仅 DEMO_MODE 启用的后端才在缓存快照中置 demo_mode（GET，无副作用）。
+  try {
+    const r = await fetch("/api/cache");
+    const s = await r.json();
+    if (s.demo_mode) {
+      $("demopanel").style.display = "block";
+      $("freeze").onclick = () => demoAction("/api/demo/freeze");
+      $("release").onclick = () => demoAction("/api/demo/release");
+    }
+  } catch (e) { /* 非演示模式：面板保持隐藏 */ }
 }
 
 $("demo").onclick = () => {
@@ -221,6 +257,7 @@ $("go").onclick = async () => {
 
 loadCatalog();
 loadCache();
+initDemoPanel();
 setInterval(loadCache, 3000);
 </script>
 </body>

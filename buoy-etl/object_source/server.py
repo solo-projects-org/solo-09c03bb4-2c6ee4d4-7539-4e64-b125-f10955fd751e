@@ -42,7 +42,7 @@ class ObjectStore:
         self._lock = threading.RLock()
         # key -> {"etag": str, "size": int, "mtime": float}
         self._meta: dict[str, dict] = {}
-        # key -> {"delay": float, "fail_after": int}
+        # key -> {"delay": float, "fail_after": int, "hold": float}
         self._sim: dict[str, dict] = {}
         self._manifest: dict[str, dict] = {}
         self._last_refresh = 0.0
@@ -130,9 +130,15 @@ class ObjectStore:
         with self._lock:
             return self._meta.get(key)
 
-    def set_simulation(self, key: str, delay: float, fail_after: int) -> None:
+    def set_simulation(
+        self, key: str, delay: float, fail_after: int, hold: float = 0.0
+    ) -> None:
         with self._lock:
-            self._sim[key] = {"delay": max(0.0, delay), "fail_after": max(0, fail_after)}
+            self._sim[key] = {
+                "delay": max(0.0, delay),
+                "fail_after": max(0, fail_after),
+                "hold": max(0.0, hold),
+            }
 
     def clear_simulation(self, key: str) -> None:
         with self._lock:
@@ -140,7 +146,9 @@ class ObjectStore:
 
     def get_simulation(self, key: str) -> dict:
         with self._lock:
-            return dict(self._sim.get(key, {"delay": 0.0, "fail_after": 0}))
+            return dict(
+                self._sim.get(key, {"delay": 0.0, "fail_after": 0, "hold": 0.0})
+            )
 
     def correct(self, key: str, payload: bytes) -> dict:
         """原子替换对象内容，返回新版本元数据。"""
@@ -166,6 +174,10 @@ class ObjectStore:
             raise FileNotFoundError(key)
         sim = self.get_simulation(key)
         sent = 0
+        # 挂住注入：响应头已发出、连接保持，但在首个数据块前休眠 hold 秒，
+        # 模拟“正常连接内暂时无数据”的慢岸站（连接并未失效）。
+        if sim["hold"]:
+            time.sleep(sim["hold"])
         with open(os.path.join(self.data_dir, key), "rb") as fh:
             while True:
                 block = fh.read(CHUNK_BYTES)
@@ -232,6 +244,7 @@ class Handler(BaseHTTPRequestHandler):
                 STORE.set_simulation(
                     body["key"], float(body.get("delay_per_chunk", 0.0)),
                     int(body.get("fail_after_bytes", body.get("fail_after", 0))),
+                    float(body.get("hold_seconds", body.get("hold", 0.0))),
                 )
             except (KeyError, ValueError) as exc:
                 self._json(400, {"detail": f"参数错误：{exc}"})

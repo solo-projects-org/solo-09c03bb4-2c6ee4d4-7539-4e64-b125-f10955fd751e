@@ -95,3 +95,21 @@ def test_404_for_missing_object(http_source):
     with pytest.raises(HTTPError) as exc:
         urlopen(f"{base_url}/objects/missing.parquet", timeout=5)
     assert exc.value.code == 404
+
+
+def test_hold_keeps_connection_then_delivers_full_object(http_source):
+    """挂住注入：连接保持、首块延迟，但最终交付完整对象（连接并未失效）。"""
+    import time as _time
+
+    base_url, store = http_source
+    store.set_simulation("day1.parquet", delay=0.0, fail_after=0, hold=1.2)
+    try:
+        t0 = _time.monotonic()
+        with urlopen(f"{base_url}/objects/day1.parquet", timeout=10) as resp:
+            assert resp.status == 200
+            data = resp.read()
+        elapsed = _time.monotonic() - t0
+        assert elapsed >= 1.0  # 确实经历了“有连接、无数据”的挂起窗口
+        assert len(data) == store.meta_for("day1.parquet")["size"]
+    finally:
+        store.clear_simulation("day1.parquet")
